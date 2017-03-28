@@ -1,0 +1,200 @@
+#!/usr/bin/env ruby
+require "pathname"
+require "fileutils"
+require "pp"
+
+require "zip"
+require "oga"
+require "css_parser"
+
+zip_file_path = ARGV.shift
+target_dir = ARGV.shift
+
+def extract_code_class(css)
+  style = CssParser::Parser::new
+  style.load_string! css
+
+  code_selectors  = style.to_h["all"].select do |k,v|
+    v["font-family"] == '"Courier New"'
+  end
+
+  if code_selectors.length > 1
+    raise "more than one code selector"
+  end
+  code_selector, _decl = code_selectors.first || []
+
+  # Remove dot in selector to find the class name
+  code_selector.sub(/^\./, "")
+end
+
+def is_title_element?(element)
+  element.name == "p"  && element["class"].include?("title")
+end
+
+HX_REGEX = /^h(?<level>\d)$/
+def process_element(element, code_class:)
+  if element.name == "p"
+    return process_p(element, code_class: code_class)
+  end
+
+  if (match = HX_REGEX.match(element.name)) != nil
+    level = match["level"].to_i(10) +1
+    return "\n\n<h#{level}>" + element.text + "</h#{level}>\n"
+  end
+
+  if element.name == "hr"
+    return "\n<hr/>\n"
+  end
+
+  raise "Unknown element #{element.name}"
+end
+
+PROCESS_P_WHITELIST=["sup"]
+def process_p(p_element, code_class:)
+  elements = []
+  p_element.children.each do |element|
+    if element.name == "span"
+      res = process_span(element, code_class: code_class)
+      if res != nil
+        elements.push(res)
+      end
+    elsif element.name == "sup"
+      # use to store comments, ignore.
+    else
+      raise "Unknown element in <p>: #{element.name}"
+    end
+  end
+
+  if elements.any?
+    "<p>\n#{elements.join("")}\n</p>\n\n"
+  else
+    ""
+  end
+end
+
+def process_span(span, code_class:)
+  children = span.children.to_a
+  if children.length == 0
+    nil
+  elsif children.length == 1 
+    child = children.first
+    if child.class == Oga::XML::Text
+      if span["class"] && span["class"].include?(code_class)
+        "<code>#{child.text}</code>"
+      else
+        "<span>#{child.text}</span>"
+      end
+    else 
+      if child.name == "a"
+        href = child["href"]
+        href = URI(href).query.gsub(/^q=/, "").gsub(/&(sa|usg|ust)=([^&])+/,"").gsub("%23", "#")
+
+        "<a href=\"#{href}\">#{child.text}</a>"
+      elsif child.name == "img"
+        "<img src=\"#{child["src"]}\">"
+      else
+        raise "unkown element in span #{child.inspect}"
+      end
+    end
+  else
+    if span["class"] && span["class"].include?(code_class)
+      html = "<pre><code>"
+
+      children.each do |span_child|
+        if span_child.class == Oga::XML::Text 
+          html += span_child.text
+        elsif span_child.name == "br"
+          html += "\n"
+        else
+          raise "Unexpected case"
+        end
+
+      end
+      html += "</code></pre>"
+      html 
+    else
+        p children.length
+        p span
+        p children
+        exit 1
+    end
+  end
+end
+
+def sanitize_html(html)
+  # Extract css styles 
+  code_class = extract_code_class html.css("head style").text
+
+  # Go through the document
+  elements = html.css("body").first.children.to_a
+
+  # Extract the title
+  title_elem = elements.shift
+  if !is_title_element?(title_elem)
+    $stderr.puts "First line in the blog should be of the Title type!"
+    exit 1
+  end
+
+  title = title_elem.text
+
+
+  sanitized_html = ""
+
+  elements.each do |element|
+    # AFAICS, div's are only used for comments.
+    next if element.name == "div"
+
+    sanitized_html += process_element(element, code_class: code_class)
+  end
+
+  { title: title,
+    html: sanitized_html
+  }
+end
+
+if zip_file_path.nil?
+  $stderr.puts "No zipfile given!"
+  exit 1
+end
+
+if !File.exist?(zip_file_path)
+  $stderr.puts "Zipfile does not exist!"
+  exit 1
+end
+
+if target_dir.nil?
+  $stderr.puts "Target directory does not exist!"
+  exit 1
+end
+
+target_path = Pathname.new(target_dir)
+
+if File.exists? target_path
+  $stderr.puts "Target dir already exists!"
+  exit 1
+else
+  FileUtils.mkdir_p(target_path)
+  FileUtils.mkdir_p(target_path.join("images"))
+end
+
+Zip::File.open(zip_file_path) do |zip_file|
+  html = zip_file.glob("*.html")
+  images = zip_file.glob("images/*")
+
+
+  if html.length != 1
+    raise "Only one html file expected!"
+  end
+
+  # Extract all images
+  images.each do |img|
+    img.extract(target_path.join(img.name))
+  end
+
+  # Get HTML
+  html = Oga.parse_html(html.first.get_input_stream.read)
+  result = sanitize_html(html)
+
+  File.write(target_path.join("index.html"), result[:html])
+  File.write(target_path.join("title"), result[:title])
+end
